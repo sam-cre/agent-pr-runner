@@ -68,7 +68,7 @@ automatically. Anything else returns `needs_fix`.
 ## Local checks
 
 When GitHub refuses to start CI for billing reasons (free Actions minutes used up, or a payment
-problem), every job ends with zero steps and a billing note. Only then, and only if
+problem), every job ends with zero steps, at least one with a billing note and any other with that note or GitHub's "was not acquired by runner" note (a job that waited about 15 minutes for a runner that never came). A run where no job mentions billing is treated as an outage, not billing. Only then, and only if
 `local_checks.enabled` is true, the runner:
 
 1. makes a clean, detached checkout of the exact pushed commit in its own work folder;

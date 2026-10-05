@@ -459,6 +459,16 @@ fn only_a_run_whose_every_job_github_refused_for_billing_is_checked_locally() {
         "YOUR SPENDING LIMIT NEEDS TO BE INCREASED"
     ));
     assert!(!is_billing_block("test result: FAILED"));
+
+    // One job refused for billing and the other never taken by a runner still counts.
+    let never = "The job was not acquired by Runner of type hosted even after multiple attempts";
+    let windows = vec![vec![note.to_string()], vec![never.to_string()]];
+    assert!(jobs_all_billing_blocked(&[job(1, 0), job(2, 0)], &windows));
+    // Never acquired everywhere, with no billing note, is an outage: no local fallback.
+    let outage = vec![vec![never.to_string()], vec![never.to_string()]];
+    assert!(!jobs_all_billing_blocked(&[job(1, 0), job(2, 0)], &outage));
+    // A never-acquired job that somehow ran steps is not blocked.
+    assert!(!jobs_all_billing_blocked(&[job(1, 0), job(2, 3)], &windows));
 }
 
 #[test]
