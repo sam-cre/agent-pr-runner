@@ -1378,6 +1378,15 @@ fn is_billing_block(message: &str) -> bool {
     BILLING_BLOCK_MARKERS.iter().any(|m| lower.contains(m))
 }
 
+/// GitHub's wording when no hosted runner took a job. In a billing-blocked run one job can end
+/// this way instead of with the billing note: one job refused for billing, another cancelled
+/// after waiting about 15 minutes for a runner that never came.
+fn is_never_acquired(message: &str) -> bool {
+    message
+        .to_ascii_lowercase()
+        .contains("was not acquired by runner")
+}
+
 /// One CI job as the jobs API reports it: its check-run id and how many steps it ran.
 #[derive(Debug, Deserialize)]
 struct BlockedJobProbe {
@@ -1385,16 +1394,22 @@ struct BlockedJobProbe {
     steps: usize,
 }
 
-/// True only when every job of the run never started (no steps) and GitHub's note on each one is
-/// the billing refusal. A job that ran and failed is never treated this way, so a real red run can
-/// not slip through to the local checks.
+/// True only when every job of the run never started (no steps), at least one job carries the
+/// billing refusal, and each of the others carries either that refusal or the never-acquired note.
+/// A job that ran and failed is never treated this way, and a run where no job mentions billing
+/// (an outage) is not either, so a real red run can not slip through to the local checks.
 fn jobs_all_billing_blocked(jobs: &[BlockedJobProbe], notes: &[Vec<String>]) -> bool {
     !jobs.is_empty()
         && jobs.len() == notes.len()
-        && jobs
+        && notes
             .iter()
-            .zip(notes)
-            .all(|(job, msgs)| job.steps == 0 && msgs.iter().any(|m| is_billing_block(m)))
+            .any(|msgs| msgs.iter().any(|m| is_billing_block(m)))
+        && jobs.iter().zip(notes).all(|(job, msgs)| {
+            job.steps == 0
+                && msgs
+                    .iter()
+                    .any(|m| is_billing_block(m) || is_never_acquired(m))
+        })
 }
 
 fn ci_billing_blocked(config: &Config, head: &str) -> Result<bool> {
