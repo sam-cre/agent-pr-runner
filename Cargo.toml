@@ -1,0 +1,30 @@
+[package]
+name = "agent-pr-runner"
+version = "0.1.0"
+edition = "2021"
+description = "An operator-owned Git and pull-request runner for AI coding agents: the agent queues data, the runner commits, opens the PR, waits for CI, and squash-merges."
+license = "MIT"
+readme = "README.md"
+keywords = ["git", "github", "pull-request", "ci", "agents"]
+categories = ["command-line-utilities", "development-tools"]
+
+[dependencies]
+anyhow = "1"
+fs2 = "0.4"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Every command the runner starts (git, gh, local checks) runs inside a kill-on-close Job Object,
+# so a timed-out check can not leave helper processes running.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+    "Win32_System_Diagnostics_ToolHelp",
+] }
+
+[profile.release]
+strip = true

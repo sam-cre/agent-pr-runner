@@ -1,0 +1,10 @@
+{
+  "enabled": true,
+  "budget_minutes": 30,
+  "steps": [
+    { "name": "make venv", "program": "python", "args": ["-m", "venv", "{cache}/venv"] },
+    { "name": "pip install", "program": "{cache}/venv/Scripts/python.exe", "args": ["-m", "pip", "install", "--quiet", "-e", ".[dev]"] },
+    { "name": "ruff", "program": "{cache}/venv/Scripts/python.exe", "args": ["-m", "ruff", "check", "."] },
+    { "name": "pytest", "program": "{cache}/venv/Scripts/python.exe", "args": ["-m", "pytest", "-q"] }
+  ]
+}

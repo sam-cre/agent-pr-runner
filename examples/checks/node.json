@@ -1,0 +1,10 @@
+{
+  "enabled": true,
+  "budget_minutes": 30,
+  "steps": [
+    { "name": "npm ci", "program": "npm", "args": ["ci", "--no-audit", "--no-fund"] },
+    { "name": "npm run lint", "program": "npm", "args": ["run", "lint"] },
+    { "name": "npm run build", "program": "npm", "args": ["run", "build"] },
+    { "name": "npm test", "program": "npm", "args": ["test"], "env": { "CI": "true" } }
+  ]
+}

@@ -1,0 +1,26 @@
+{
+  "id": "fix-parser-empty-input-1",
+  "expected_head": "0123456789abcdef0123456789abcdef01234567",
+  "branch": "fix/parser-empty-input",
+  "create_branch": true,
+  "files": [
+    "src/parser.rs",
+    "tests/parser.rs",
+    "docs/parser.md"
+  ],
+  "commit_message": "fix: return an empty document for empty input",
+  "pr_title": "fix: return an empty document for empty input",
+  "summary": [
+    "The parser panicked on an empty file; it now returns an empty document.",
+    "Adds a regression test and documents the behavior."
+  ],
+  "verification": [
+    { "check": "cargo test", "result": "212 passed, 0 failed" },
+    { "check": "cargo clippy --all-targets -- -D warnings", "result": "clean" },
+    { "check": "New test fails before the fix", "result": "confirmed: panicked at parser.rs:41" }
+  ],
+  "traceability": [
+    "Issue 57: crash on empty file",
+    "docs/parser.md, Empty input section"
+  ]
+}

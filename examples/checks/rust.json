@@ -1,0 +1,13 @@
+{
+  "enabled": true,
+  "budget_minutes": 60,
+  "steps": [
+    { "name": "cargo fmt", "program": "cargo", "args": ["fmt", "--all", "--check"] },
+    { "name": "cargo test", "program": "cargo", "args": ["test", "--all-features"],
+      "env": { "CARGO_TARGET_DIR": "{cache}/target", "CARGO_INCREMENTAL": "0", "RUST_BACKTRACE": "1" } },
+    { "name": "cargo clean", "program": "cargo", "args": ["clean"],
+      "env": { "CARGO_TARGET_DIR": "{cache}/target" } },
+    { "name": "cargo clippy", "program": "cargo", "args": ["clippy", "--all-targets", "--all-features", "--", "-D", "warnings"],
+      "env": { "CARGO_TARGET_DIR": "{cache}/target", "CARGO_INCREMENTAL": "0" } }
+  ]
+}

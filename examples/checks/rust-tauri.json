@@ -1,0 +1,24 @@
+{
+  "enabled": true,
+  "budget_minutes": 60,
+  "steps": [
+    { "name": "cargo test", "program": "cargo", "args": ["test"],
+      "env": { "CARGO_TARGET_DIR": "{cache}/target", "CARGO_INCREMENTAL": "0", "RUST_BACKTRACE": "1" } },
+    { "name": "cargo nextest", "program": "cargo", "args": ["nextest", "run", "--all-features"],
+      "env": { "CARGO_TARGET_DIR": "{cache}/target", "CARGO_INCREMENTAL": "0" } },
+    { "name": "cargo clean", "program": "cargo", "args": ["clean"],
+      "env": { "CARGO_TARGET_DIR": "{cache}/target" } },
+    { "name": "cargo clippy", "program": "cargo", "args": ["clippy", "--all-targets", "--all-features", "--", "-D", "warnings"],
+      "env": { "CARGO_TARGET_DIR": "{cache}/target", "CARGO_INCREMENTAL": "0" } },
+    { "name": "npm ci", "program": "npm", "args": ["ci", "--no-audit", "--no-fund"], "dir": "app",
+      "only_if_exists": ["app/package.json"] },
+    { "name": "npm run build", "program": "npm", "args": ["run", "build"], "dir": "app",
+      "only_if_exists": ["app/package.json"] },
+    { "name": "app cargo clippy", "program": "cargo", "args": ["clippy", "--all-targets", "--", "-D", "warnings"], "dir": "app/src-tauri",
+      "env": { "CARGO_TARGET_DIR": "{cache}/app-target", "CARGO_INCREMENTAL": "0" },
+      "only_if_exists": ["app/src-tauri/Cargo.toml"] },
+    { "name": "app cargo test", "program": "cargo", "args": ["test"], "dir": "app/src-tauri",
+      "env": { "CARGO_TARGET_DIR": "{cache}/app-target", "CARGO_INCREMENTAL": "0" },
+      "only_if_exists": ["app/src-tauri/Cargo.toml"] }
+  ]
+}

@@ -1,0 +1,33 @@
+{
+  "repo": "C:/Users/you/code/your-project",
+  "queue_dir": "C:/Users/you/agent-pr-runner/queues/your-project",
+  "git_exe": "C:/Program Files/Git/cmd/git.exe",
+  "gh_exe": "C:/Program Files/GitHub CLI/gh.exe",
+  "repository": "your-account/your-project",
+  "author_name": "your-account",
+  "author_email": "12345678+your-account@users.noreply.github.com",
+  "github_login": "your-account",
+  "base_branch": "main",
+  "remote": "origin",
+  "ci": {
+    "workflow_name": "CI",
+    "workflow_file": ".github/workflows/ci.yml",
+    "required_jobs": ["lint + test (ubuntu-latest)", "lint + test (windows-latest)"],
+    "timeout_minutes": 30
+  },
+  "local_checks": {
+    "enabled": true,
+    "budget_minutes": 60,
+    "steps": [
+      { "name": "cargo test", "program": "cargo", "args": ["test", "--all-features"],
+        "env": { "CARGO_TARGET_DIR": "{cache}/target", "CARGO_INCREMENTAL": "0", "RUST_BACKTRACE": "1" } },
+      { "name": "cargo clean", "program": "cargo", "args": ["clean"],
+        "env": { "CARGO_TARGET_DIR": "{cache}/target" } },
+      { "name": "cargo clippy", "program": "cargo", "args": ["clippy", "--all-targets", "--all-features", "--", "-D", "warnings"],
+        "env": { "CARGO_TARGET_DIR": "{cache}/target", "CARGO_INCREMENTAL": "0" } }
+    ]
+  },
+  "protected_paths": ["Cargo.toml", "build.rs", ".cargo/", "rust-toolchain.toml"],
+  "blocked_words": [],
+  "cache_limit_gb": 5
+}
