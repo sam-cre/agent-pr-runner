@@ -1,6 +1,6 @@
 use super::*;
 
-fn request() -> Request {
+pub(crate) fn request() -> Request {
     Request {
         id: "case-1".into(),
         branch: "fix/example".into(),
@@ -279,6 +279,8 @@ fn failure_description_names_the_kind_and_keeps_the_excerpt() {
         pr_url: None,
         diagnostic_log: None,
         failure_kind: None,
+        action: None,
+        next: None,
     };
     assert!(!serde_json::to_string(&receipt)
         .unwrap()

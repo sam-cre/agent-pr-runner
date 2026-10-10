@@ -71,7 +71,7 @@ On Windows, the binary is `agent-pr-runner.exe` in `%USERPROFILE%\agent-pr-runne
 
 ## Day to day
 
-The agent makes a change, runs your checks, writes a request, and runs `agent-pr-runner submit <queue> <request.json>`. It reports the PR link, or fixes and resubmits based on the receipt. You keep `serve` running, review merged PRs, and apply changes to protected files when the agent asks.
+The agent makes a change, runs your checks, and runs `agent-pr-runner publish <config> --message "fix: ..." --verify "check=result" ...`. Publish builds the request from `git status`, checks it (`preflight`), queues it, and returns at once. Each receipt names an `action` and the exact `next` command, so the agent reports the PR link or fixes and retries without guessing. You keep `serve` running, review merged PRs, and apply changes to protected files when the agent asks.
 
 Request and receipt fields: [docs/requests.md](docs/requests.md).
 
