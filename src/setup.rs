@@ -82,7 +82,7 @@ fn project_kind(repo: &Path) -> Option<&'static str> {
 }
 
 /// A path as people write it: no `\\?\` prefix, and forward slashes on Windows.
-fn plain(path: &Path) -> String {
+pub(crate) fn plain(path: &Path) -> String {
     let text = path.display().to_string();
     let text = text.strip_prefix(r"\\?\").unwrap_or(&text);
     if cfg!(windows) {
@@ -684,31 +684,23 @@ pub(crate) fn init(args: &[String]) -> Result<()> {
 // snippet
 // ---------------------------------------------------------------------------------------------
 
-/// The agent instructions section with this install's runner and queue paths filled in.
-fn fill_snippet(exe: &str, queue: &str) -> String {
+/// The agent instructions section with this install's runner, config, and queue filled in, written
+/// so the commands paste into PowerShell (and, for paths without spaces, cmd and bash too).
+fn fill_snippet(exe: &str, config: &str, queue: &str) -> String {
     let text = SNIPPET.replace("\r\n", "\n");
     let body = text.split_once("\n---\n").map_or(text.as_str(), |(_, b)| b);
     body.trim_start()
-        .replace(
-            "`<INSTALL_DIR>/agent-pr-runner` (`.exe` on Windows)",
-            &format!("`{exe}`"),
-        )
-        .replace("`<INSTALL_DIR>/queues/<project>`", &format!("`{queue}`"))
-        .replace(
-            "<INSTALL_DIR>/agent-pr-runner submit <QUEUE_DIR>",
-            &format!("\"{exe}\" submit \"{queue}\""),
-        )
-        .replace(
-            "<INSTALL_DIR>/agent-pr-runner status <QUEUE_DIR>",
-            &format!("\"{exe}\" status \"{queue}\""),
-        )
+        .replace("<RUNNER>", &agent::program(exe))
+        .replace("<CONFIG>", &agent::shell_arg(config))
+        .replace("<QUEUE_DIR>", &agent::shell_arg(queue))
 }
 
 pub(crate) fn snippet(config_path: &Path) -> Result<()> {
     let config = load_installed_config(config_path)?;
     let exe = plain(&fs::canonicalize(std::env::current_exe()?)?);
+    let config_text = plain(&fs::canonicalize(config_path)?);
     let queue = plain(&fs::canonicalize(&config.queue_dir)?);
-    print!("{}", fill_snippet(&exe, &queue));
+    print!("{}", fill_snippet(&exe, &config_text, &queue));
     Ok(())
 }
 
@@ -788,13 +780,19 @@ mod tests {
 
     #[test]
     fn the_snippet_gets_real_paths() {
-        let text = fill_snippet("C:/apr/agent-pr-runner.exe", "C:/apr/queues/app");
-        assert!(
-            !text.contains("<INSTALL_DIR>") && !text.contains("<QUEUE_DIR>"),
-            "{text}"
+        let text = fill_snippet(
+            "C:/apr/agent-pr-runner.exe",
+            "C:/apr/configs/app.json",
+            "C:/apr/queues/app",
         );
+        assert!(!text.contains('<'), "{text}");
         assert!(text.starts_with("## Publishing changes"));
-        assert!(text.contains("\"C:/apr/agent-pr-runner.exe\" submit \"C:/apr/queues/app\""));
+        assert!(
+            text.contains("C:/apr/agent-pr-runner.exe publish C:/apr/configs/app.json --message")
+        );
+        assert!(text.contains("C:/apr/agent-pr-runner.exe status C:/apr/queues/app ID"));
+        let spaced = fill_snippet("C:/My Tools/apr.exe", "C:/c.json", "C:/q");
+        assert!(spaced.contains("& 'C:/My Tools/apr.exe' publish C:/c.json"));
     }
 
     #[test]

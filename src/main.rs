@@ -8,9 +8,11 @@
 //! When GitHub refuses to start CI for billing reasons, it runs the configured checks itself on a
 //! clean checkout of the exact commit instead.
 
+mod agent;
 mod process;
 mod setup;
 
+use agent::Problem;
 use anyhow::{bail, Context, Result};
 use fs2::FileExt;
 use regex::Regex;
@@ -224,6 +226,13 @@ struct Receipt {
     /// Set on `needs_fix`: infra_transient, test_failure, lint, build, or unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     failure_kind: Option<String>,
+    /// A stable code for what the agent does next: done, fix_code, fix_request, resume,
+    /// report_to_operator, wait, unknown_id, or unclassified (written by an older runner).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    action: Option<String>,
+    /// The exact command for that next step, when there is one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    next: Option<String>,
 }
 
 struct Capture {
@@ -306,8 +315,22 @@ fn protected_path(file: &str, policy: &Policy) -> bool {
 }
 
 fn validate_request(request: &Request, policy: &Policy) -> Result<()> {
+    match request_problems(request, policy).into_iter().next() {
+        Some(problem) => bail!("{}", problem.problem),
+        None => Ok(()),
+    }
+}
+
+/// Everything wrong with a request on its own, before Git is consulted, each with its fix.
+/// `validate_request` refuses on the first one; `preflight` and `publish` list them all.
+fn request_problems(request: &Request, policy: &Policy) -> Vec<Problem> {
+    let mut found = Vec::new();
     if !valid_id(&request.id) {
-        bail!("invalid request id: use 1 to 80 letters, digits, '-' or '_'");
+        found.push(Problem::new(
+            "bad_id",
+            "invalid request id: use 1 to 80 letters, digits, '-' or '_'",
+            "pick a new id from letters, digits, '-' and '_' (publish picks one for you)",
+        ));
     }
     // `git check-ref-format` runs later. A leading '-' would be read as a Git option, so it is
     // rejected here before any command sees it.
@@ -319,23 +342,43 @@ fn validate_request(request: &Request, policy: &Policy) -> Result<()> {
             .any(|c| c.is_whitespace() || c.is_control())
         || request.branch.contains("..")
     {
-        bail!("branch name is unsafe");
+        found.push(Problem::new(
+            "unsafe_branch",
+            "branch name is unsafe",
+            "use a name like fix/short-purpose: no spaces, no '..', not starting with '-'",
+        ));
     }
     if (!request.expected_head.is_empty() || !request.create_branch)
         && (request.expected_head.len() != 40
             || !request.expected_head.bytes().all(|b| b.is_ascii_hexdigit()))
     {
-        bail!("expected_head must be a full Git SHA");
+        found.push(Problem::new(
+            "bad_expected_head",
+            "expected_head must be a full Git SHA",
+            "set expected_head to the output of `git rev-parse HEAD`",
+        ));
     }
     if request.resume {
         if request.create_branch || request.expected_head.is_empty() {
-            bail!("resume needs create_branch false and the branch's expected_head");
+            found.push(Problem::new(
+                "bad_resume",
+                "resume needs create_branch false and the branch's expected_head",
+                "set create_branch to false and expected_head to the branch's current HEAD",
+            ));
         }
         if !request.files.is_empty() {
-            bail!("resume stages nothing; files must be empty");
+            found.push(Problem::new(
+                "bad_resume",
+                "resume stages nothing; files must be empty",
+                "set files to []",
+            ));
         }
     } else if request.files.is_empty() {
-        bail!("request has no files to stage");
+        found.push(Problem::new(
+            "no_files",
+            "request has no files to stage",
+            "save the change first; `git status` must list it",
+        ));
     }
     let mut unique = BTreeSet::new();
     for file in &request.files {
@@ -350,10 +393,19 @@ fn validate_request(request: &Request, policy: &Policy) -> Result<()> {
             || file.starts_with(':')
             || !unique.insert(file)
         {
-            bail!("unsafe or duplicate staged path: {file}");
-        }
-        if protected_path(file, policy) {
-            bail!("{file} is operator-only; the operator must change it by hand");
+            found.push(Problem::new(
+                "unsafe_path",
+                format!("unsafe or duplicate staged path: {file}"),
+                "list each file once, relative to the repository root, with '/' and no wildcards",
+            ));
+        } else if protected_path(file, policy) {
+            found.push(Problem::new(
+                "operator_only",
+                format!("{file} is operator-only; the operator must change it by hand"),
+                format!(
+                    "leave {file} out (publish: --exclude {file}) and ask the operator to apply it"
+                ),
+            ));
         }
     }
     let message_lower = request.commit_message.to_ascii_lowercase();
@@ -371,23 +423,40 @@ fn validate_request(request: &Request, policy: &Policy) -> Result<()> {
         .iter()
         .any(|token| message_lower.contains(token))
     {
-        bail!("commit message must be one conventional-commit line without attribution trailers");
+        found.push(Problem::new(
+            "bad_commit_message",
+            "commit message must be one conventional-commit line without attribution trailers",
+            "use one line of at most 120 characters, like `fix: what changed`, with no trailers \
+             or CI-skip markers",
+        ));
     }
     if request.pr_title.trim().is_empty()
         || request.pr_title.contains(['\n', '\r'])
         || request.pr_title.len() > 120
         || has_attribution(&request.pr_title)
     {
-        bail!("invalid PR title");
+        found.push(Problem::new(
+            "bad_pr_title",
+            "invalid PR title",
+            "use one line of at most 120 characters, like `fix: what changed`",
+        ));
     }
     if !is_semantic(&request.commit_message) || !is_semantic(&request.pr_title) {
-        bail!("commit message and PR title must start with a semantic type such as feat: or fix:");
+        found.push(Problem::new(
+            "not_semantic",
+            "commit message and PR title must start with a semantic type such as feat: or fix:",
+            format!("start with one of: {}", SEMANTIC_TYPES.join(": ") + ":"),
+        ));
     }
     if request.summary.is_empty()
         || request.verification.is_empty()
         || request.traceability.is_empty()
     {
-        bail!("PR summary, verification evidence, and traceability are required");
+        found.push(Problem::new(
+            "missing_body",
+            "PR summary, verification evidence, and traceability are required",
+            "give at least one --summary, one --verify \"check=result\", and one --trace",
+        ));
     }
     let evidence_cells = request
         .verification
@@ -405,16 +474,29 @@ fn validate_request(request: &Request, policy: &Policy) -> Result<()> {
             || has_attribution(line)
             || names_blocked_word(line, policy)
         {
-            bail!("PR body contains an empty, oversized, multiline, attribution, or blocked line");
+            found.push(Problem::new(
+                "bad_body_line",
+                "PR body contains an empty, oversized, multiline, attribution, or blocked line",
+                format!(
+                    "rewrite this line (one line, at most 500 characters, no AI product names or \
+                     attribution): {}",
+                    compact(line, 80)
+                ),
+            ));
         }
     }
     if [&request.branch, &request.commit_message, &request.pr_title]
         .iter()
         .any(|text| names_blocked_word(text, policy))
     {
-        bail!("branch, commit message, and PR title must not name an AI product or blocked word");
+        found.push(Problem::new(
+            "blocked_word",
+            "branch, commit message, and PR title must not name an AI product or blocked word",
+            "remove AI product names and the config's blocked_words from the branch, message, \
+             and title",
+        ));
     }
-    Ok(())
+    found
 }
 
 /// A folder or file inside the checkout: relative, with no `..`, no root, and no drive.
@@ -1908,14 +1990,14 @@ fn needs_fix(
         pr_url: Some(pr_url),
         diagnostic_log: log,
         failure_kind: kind,
+        action: None,
+        next: None,
     }
 }
 
-fn execute(config: &Config, request: &Request) -> Result<Receipt> {
-    validate_request(request, &config.policy())?;
-    if targets_base(&request.branch, &config.base_branch) {
-        bail!("request branch must not be the base branch");
-    }
+/// The runner's own setup, which no request can fix: the `gh` login and the pinned remote. A
+/// failure here is the operator's to fix.
+fn check_operator_setup(config: &Config) -> Result<()> {
     let login = checked(
         gh(config, &["api", "user", "--jq", ".login"])?,
         "checking GitHub login",
@@ -1929,6 +2011,15 @@ fn execute(config: &Config, request: &Request) -> Result<Receipt> {
     )?;
     if !remote_matches(&remote, &config.repository) {
         bail!("Git remote does not match the pinned GitHub repository");
+    }
+    Ok(())
+}
+
+/// Runs one request after `check_operator_setup` passed.
+fn execute(config: &Config, request: &Request) -> Result<Receipt> {
+    validate_request(request, &config.policy())?;
+    if targets_base(&request.branch, &config.base_branch) {
+        bail!("request branch must not be the base branch");
     }
 
     let head = {
@@ -2046,7 +2137,7 @@ fn execute(config: &Config, request: &Request) -> Result<Receipt> {
         }
         if ci_billing_blocked(config, &head)? {
             if !config.local_checks.enabled {
-                return Ok(needs_fix(
+                let mut receipt = needs_fix(
                     request,
                     pr.url,
                     "GitHub could not start CI (billing) and local checks are off in the runner \
@@ -2054,7 +2145,9 @@ fn execute(config: &Config, request: &Request) -> Result<Receipt> {
                         .into(),
                     None,
                     Some("infra_transient".into()),
-                ));
+                );
+                receipt.action = Some(agent::REPORT.into());
+                return Ok(receipt);
             }
             let checks = run_local_checks(config, request, &head)?;
             if let Some(step) = checks.failed {
@@ -2226,6 +2319,8 @@ fn execute(config: &Config, request: &Request) -> Result<Receipt> {
             pr_url: Some(pr.url),
             diagnostic_log: None,
             failure_kind: None,
+            action: None,
+            next: None,
         });
     }
     Ok(Receipt {
@@ -2243,6 +2338,8 @@ fn execute(config: &Config, request: &Request) -> Result<Receipt> {
         pr_url: Some(pr.url),
         diagnostic_log: None,
         failure_kind: None,
+        action: None,
+        next: None,
     })
 }
 
@@ -2254,6 +2351,31 @@ fn queue_path(queue: &Path, id: &str, suffix: &str) -> PathBuf {
     queue.join(format!("{id}.{suffix}.json"))
 }
 
+/// Whether `id` was ever queued. `sent` is the copy `serve` keeps after a request ran.
+fn id_used(queue: &Path, id: &str) -> bool {
+    ["request", "processing", "result", "sent"]
+        .iter()
+        .any(|suffix| queue_path(queue, id, suffix).exists())
+}
+
+/// Puts a request in the queue under a new id.
+fn enqueue(queue: &Path, request: &Request) -> Result<()> {
+    if serde_json::to_vec(request)?.len() > 64 * 1024 {
+        bail!("request exceeds 64 KiB");
+    }
+    let lock = OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(queue.join("submit.lock"))?;
+    lock.lock_exclusive()?;
+    if id_used(queue, &request.id) {
+        bail!("request id already exists; choose a new id");
+    }
+    write_json(&queue_path(queue, &request.id, "request"), request)
+}
+
 fn submit(queue: &Path, request_path: &Path) -> Result<()> {
     let queue = fs::canonicalize(queue).context("runner queue does not exist")?;
     let bytes = fs::read(request_path)?;
@@ -2262,24 +2384,8 @@ fn submit(queue: &Path, request_path: &Path) -> Result<()> {
     }
     let request: Request = serde_json::from_slice(&bytes)?;
     validate_request(&request, &Policy::default())?;
-    let target = queue_path(&queue, &request.id, "request");
+    enqueue(&queue, &request)?;
     let result = queue_path(&queue, &request.id, "result");
-    {
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(queue.join("submit.lock"))?;
-        lock.lock_exclusive()?;
-        if target.exists()
-            || result.exists()
-            || queue_path(&queue, &request.id, "processing").exists()
-        {
-            bail!("request id already exists; choose a new id");
-        }
-        write_json(&target, &request)?;
-    }
     let start = Instant::now();
     loop {
         if let Ok(content) = fs::read(&result) {
@@ -2300,17 +2406,27 @@ fn submit(queue: &Path, request_path: &Path) -> Result<()> {
     }
 }
 
-/// Prints the receipt for `id`, or where the request is when it has none yet. Lets an agent whose
-/// shell times out before `submit` returns pick the result up later.
-fn status(queue: &Path, id: &str) -> Result<()> {
+/// Prints the receipt for `id`, or where the request is when it has none yet. With a wait, it
+/// checks for up to that many seconds first, so an agent polls without one long blocking call.
+fn status(queue: &Path, id: &str, wait: Duration) -> Result<()> {
     if !valid_id(id) {
         bail!("invalid request id");
     }
     let queue = fs::canonicalize(queue).context("runner queue does not exist")?;
-    if let Ok(content) = fs::read(queue_path(&queue, id, "result")) {
-        let receipt: Receipt = serde_json::from_slice(&content)?;
-        println!("{}", serde_json::to_string(&receipt)?);
-        return Ok(());
+    let start = Instant::now();
+    loop {
+        if let Ok(content) = fs::read(queue_path(&queue, id, "result")) {
+            let mut receipt: Receipt = serde_json::from_slice(&content)?;
+            if receipt.action.is_none() {
+                receipt.action = Some(agent::legacy_action(&receipt.status).into());
+            }
+            println!("{}", serde_json::to_string(&receipt)?);
+            return Ok(());
+        }
+        if start.elapsed() >= wait {
+            break;
+        }
+        thread::sleep(Duration::from_secs(2));
     }
     let state = if queue_path(&queue, id, "processing").exists() {
         "processing"
@@ -2319,7 +2435,15 @@ fn status(queue: &Path, id: &str) -> Result<()> {
     } else {
         "unknown"
     };
-    println!("{}", serde_json::json!({"id": id, "status": state}));
+    let (action, next) = if state == "unknown" {
+        (agent::UNKNOWN_ID, None)
+    } else {
+        (agent::WAIT, Some(agent::status_command(&queue, id)?))
+    };
+    println!(
+        "{}",
+        serde_json::json!({"id": id, "status": state, "action": action, "next": next})
+    );
     Ok(())
 }
 
@@ -2471,9 +2595,54 @@ fn serve_lock(queue: &Path) -> Result<File> {
     Ok(file)
 }
 
+fn error_receipt(id: &str, err: &anyhow::Error) -> Receipt {
+    Receipt {
+        id: id.into(),
+        status: "error".into(),
+        detail: compact(&redact_excerpt(&format!("{err:#}")), 1200),
+        pr_url: None,
+        diagnostic_log: None,
+        failure_kind: None,
+        action: None,
+        next: None,
+    }
+}
+
+/// Reads and runs one taken request. The request comes back too, when it parsed, so the receipt
+/// can name the next step.
+fn run_request(config: &Config, processing: &Path, id: &str) -> (Option<Request>, Receipt) {
+    let request = (|| -> Result<Request> {
+        let request: Request = serde_json::from_slice(&fs::read(processing)?)?;
+        if request.id != id {
+            bail!("request filename and id differ");
+        }
+        Ok(request)
+    })();
+    let request = match request {
+        Ok(request) => request,
+        Err(err) => return (None, error_receipt(id, &err)),
+    };
+    if let Err(err) = check_operator_setup(config) {
+        let mut receipt = error_receipt(id, &err);
+        receipt.action = Some(agent::REPORT.into());
+        return (Some(request), receipt);
+    }
+    let receipt = execute(config, &request).unwrap_or_else(|err| error_receipt(id, &err));
+    (Some(request), receipt)
+}
+
+/// Keeps a finished request as `<id>.sent.json`, so `publish --retry` can reuse its text.
+fn archive_request(queue: &Path, processing: &Path, id: &str) -> Result<()> {
+    if fs::rename(processing, queue_path(queue, id, "sent")).is_err() {
+        fs::remove_file(processing)?;
+    }
+    Ok(())
+}
+
 fn serve(config_path: &Path) -> Result<()> {
     let config = load_installed_config(config_path)?;
     let _serve_lock = serve_lock(&config.queue_dir)?;
+    agent::start_heartbeat(config_path, &fs::read(config_path)?, &config.queue_dir)?;
     // A crash after taking a request might already have committed or pushed it. Never replay that
     // request automatically. Return an inspection-required receipt instead.
     for entry in fs::read_dir(&config.queue_dir)? {
@@ -2500,9 +2669,12 @@ fn serve(config_path: &Path) -> Result<()> {
                     pr_url: None,
                     diagnostic_log: None,
                     failure_kind: None,
+                    action: Some(agent::REPORT.into()),
+                    next: None,
                 },
             )?;
         }
+        archive_request(&config.queue_dir, &path, id)?;
     }
     eprintln!(
         "agent-pr-runner serving {} from queue {}",
@@ -2535,25 +2707,11 @@ fn serve(config_path: &Path) -> Result<()> {
             }
             let processing = queue_path(&config.queue_dir, id, "processing");
             fs::rename(&path, &processing)?;
-            let outcome = (|| -> Result<Receipt> {
-                let bytes = fs::read(&processing)?;
-                let request: Request = serde_json::from_slice(&bytes)?;
-                if request.id != id {
-                    bail!("request filename and id differ");
-                }
-                execute(&config, &request)
-            })();
-            let receipt = outcome.unwrap_or_else(|err| Receipt {
-                id: id.into(),
-                status: "error".into(),
-                detail: compact(&redact_excerpt(&format!("{err:#}")), 1200),
-                pr_url: None,
-                diagnostic_log: None,
-                failure_kind: None,
-            });
+            let (request, mut receipt) = run_request(&config, &processing, id);
+            agent::finish_receipt(&mut receipt, &config, config_path, request.as_ref());
             eprintln!("{id}: {}", receipt.status);
             write_json(&queue_path(&config.queue_dir, id, "result"), &receipt)?;
-            fs::remove_file(&processing)?;
+            archive_request(&config.queue_dir, &processing, id)?;
             tidy_build_cache(&config);
         }
         thread::sleep(Duration::from_secs(2));
@@ -2565,8 +2723,26 @@ const USAGE: &str = "usage:
   agent-pr-runner snippet CONFIG.json           print the agent instructions with real paths
   agent-pr-runner doctor CONFIG.json            check the install, login, remote, and check programs
   agent-pr-runner serve CONFIG.json             process queued requests until stopped
+  agent-pr-runner publish CONFIG.json OPTIONS   build a request from git status, check it, queue it
+  agent-pr-runner preflight CONFIG.json REQUEST.json
+                                                list every problem with a request; queues nothing
   agent-pr-runner submit QUEUE_DIR REQUEST.json queue a request and wait for its receipt
-  agent-pr-runner status QUEUE_DIR ID           print a request's receipt or where it is
+  agent-pr-runner status QUEUE_DIR ID [--wait SECONDS]
+                                                print a request's receipt or where it is; with
+                                                --wait, keep checking up to SECONDS (at most 900)
+
+publish options:
+  --message TEXT        commit message, semantic type first (required unless --retry)
+  --summary TEXT        a PR summary line; repeat for each
+  --summary-file FILE   PR summary lines, one per line
+  --verify CHECK=RESULT a verification row, such as \"cargo test=212 passed\"; repeat for each
+  --trace TEXT          what the change answers; repeat for each
+  --title TEXT          PR title (default: the message)
+  --branch NAME         new branch name when starting on the base branch (default: from the message)
+  --exclude PATH        leave a changed file out; repeat for each
+  --retry ID            reuse an earlier attempt's text; given options replace it
+  --id ID               request id (default: a fresh one from the branch)
+  --dry-run             print the request and its problems; queue nothing
 
 init options:
   --name NAME                       config and queue name (default: the repository folder name)
@@ -2578,27 +2754,43 @@ init options:
   --protect-manifests               make the project's manifest files operator-only
   --force                           replace an existing config of the same name";
 
+fn utf8_args(args: &[std::ffi::OsString]) -> Result<Vec<String>> {
+    args.iter()
+        .map(|arg| {
+            arg.to_str()
+                .map(String::from)
+                .context("arguments must be UTF-8")
+        })
+        .collect()
+}
+
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args_os().collect();
     match args.as_slice() {
         [_, mode, config] if mode == "serve" => serve(Path::new(config)),
         [_, mode, config] if mode == "doctor" => doctor(Path::new(config)),
         [_, mode, config] if mode == "snippet" => setup::snippet(Path::new(config)),
-        [_, mode, rest @ ..] if mode == "init" => {
-            let rest: Vec<String> = rest
-                .iter()
-                .map(|arg| {
-                    arg.to_str()
-                        .map(String::from)
-                        .context("arguments must be UTF-8")
-                })
-                .collect::<Result<_>>()?;
-            setup::init(&rest)
+        [_, mode, rest @ ..] if mode == "init" => setup::init(&utf8_args(rest)?),
+        [_, mode, config, rest @ ..] if mode == "publish" => {
+            agent::publish(Path::new(config), &utf8_args(rest)?)
+        }
+        [_, mode, config, request] if mode == "preflight" => {
+            agent::preflight(Path::new(config), Path::new(request))
         }
         [_, mode, queue, request] if mode == "submit" => {
             submit(Path::new(queue), Path::new(request))
         }
-        [_, mode, queue, id] if mode == "status" => status(Path::new(queue), &id.to_string_lossy()),
+        [_, mode, queue, id] if mode == "status" => {
+            status(Path::new(queue), &id.to_string_lossy(), Duration::ZERO)
+        }
+        [_, mode, queue, id, flag, seconds] if mode == "status" && flag == "--wait" => {
+            let seconds: u64 = seconds
+                .to_str()
+                .and_then(|s| s.parse().ok())
+                .context("--wait needs a number of seconds")?;
+            let wait = Duration::from_secs(seconds.min(agent::MAX_STATUS_WAIT));
+            status(Path::new(queue), &id.to_string_lossy(), wait)
+        }
         [_, mode] if mode == "--version" || mode == "version" => {
             println!("agent-pr-runner {}", env!("CARGO_PKG_VERSION"));
             Ok(())

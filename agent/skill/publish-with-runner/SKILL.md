@@ -5,54 +5,42 @@ description: Publish a finished change through the operator-owned agent-pr-runne
 
 # Publish with the runner
 
-The repository's agent instructions name the runner executable and queue folder. If they do not,
-stop and ask the operator for both paths. Never fall back to Git write commands.
+The repository's agent instructions name the runner executable, its config, and its queue. If
+they do not, stop and ask the operator. Never fall back to Git write commands.
 
-## Before submitting
+## Publish
 
 1. Make sure the change is complete and is one logical change.
 2. Run every verification gate the repository's instructions list. Record each command and its
-   real result. Do not submit with a failing gate.
-3. Collect the exact list of changed paths for this change only:
-   `git status --porcelain` and `git diff --name-only`. Leave out unrelated files, scratch files,
-   and anything the operator owns.
-4. Read `git rev-parse HEAD` (full SHA) and `git branch --show-current`.
-
-## Write the request
-
-Write JSON to a file outside the repository:
-
-- `id`: new, unique, descriptive, such as `fix-login-timeout-1`. Never reuse one.
-- `expected_head`: the full SHA from step 4.
-- `branch`: neutral and purpose-based, such as `fix/login-timeout`. No AI product names.
-- `create_branch`: `true` from the base branch; `false` to add to an existing PR branch.
-- `files`: the paths from step 3, relative to the root, exactly as Git prints them.
-- `commit_message` and `pr_title`: one line, semantic type first (`fix: ...`), at most 120
-  characters, the same text in both unless there is a reason to differ.
-- `summary`: what changed and why, one short point per entry.
-- `verification`: one `{ "check", "result" }` row per gate from step 2, with observed results.
-- `traceability`: what the change answers (issue, plan item, owner request, doc section).
+   real result. Do not publish with a failing gate.
+3. Run `<runner> publish <config>` with:
+   - `--message "fix: what changed"`: one line, semantic type first, at most 120 characters.
+   - `--summary "..."`: what changed and why, one per point (or `--summary-file FILE`).
+   - `--verify "check=result"`: one per gate from step 2, with observed results.
+   - `--trace "..."`: what the change answers (issue, plan item, owner request).
+   - `--exclude PATH` for each changed file that is not part of this change.
+   Publish takes the files from `git status` and fills in HEAD, branch, and id itself.
+4. If it prints `problem` lines, apply each `fix:` and run it again. Nothing was queued.
+   `warning` lines do not stop it, but mention them if the request later fails.
 
 Never include co-author lines, "generated with" lines, AI product names, or any attribution in
-any field. The runner refuses them and nothing is published.
+any text. The runner refuses them.
 
-## Submit
+## Wait
 
-Run `<runner> submit <queue> <request.json>` with the longest timeout your shell allows. It blocks
-until the runner writes a receipt (CI can take 30 minutes or more). If the shell times out, poll
-with `<runner> status <queue> <id>` every few minutes until the status is final.
+Run the `next:` command publish printed (`status ... --wait 300`). Repeat it while the receipt's
+`action` is `wait`. Each call returns within five minutes.
 
-## Read the receipt
+## Act on the receipt's `action`
 
-- `merged`: report the PR URL. The checkout is on the updated base branch.
-- `needs_fix`: open `diagnostic_log`, fix the cause, rerun the gates, and submit a new request with
-  the same branch, `create_branch: false`, the current HEAD, and a new id.
-- `error`: if no commit was made, fix the cause and resubmit with a new id. If the commit was
-  already pushed (the branch exists on GitHub or `git log` shows the runner's commit), resubmit
-  with `resume: true`, `files: []`, `create_branch: false`, current HEAD, and a new id.
-- `merged_needs_refresh` or `needs_inspection`: stop and report to the operator with the detail.
+- `done`: report the PR URL.
+- `fix_code`: read `detail` and `diagnostic_log`, fix the cause, rerun the gates, then run `next`
+  with the new `--verify` results.
+- `fix_request`: fix what `detail` names, then run `next`.
+- `resume`: run `next` unchanged. The commit already exists.
+- `report_to_operator`: stop and report `detail`. Do not retry.
 
 ## Operator-only files
 
-If the change needs a CI workflow, `.git*` file, `CODEOWNERS`, or a path the runner config
-protects, write the proposed file outside the repository and ask the operator to apply it.
+If the change needs a CI workflow, `.git*` file, `CODEOWNERS`, or a path the config protects,
+exclude it, write the proposed file outside the repository, and ask the operator to apply it.
