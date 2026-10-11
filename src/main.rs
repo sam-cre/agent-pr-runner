@@ -1633,7 +1633,8 @@ fn run_local_checks(config: &Config, request: &Request, head: &str) -> Result<Lo
     let dir = work.join("verify");
     let cache = work.join("build");
     fs::create_dir_all(&cache)?;
-    let dir_arg = dir.display().to_string();
+    // Git for Windows rejects the extended-length `\\?\` prefix, so pass a plain path.
+    let dir_arg = setup::plain(&dir);
     let _ = git(config, &["worktree", "remove", "--force", &dir_arg], false);
     if dir.exists() {
         fs::remove_dir_all(&dir).context("clearing the previous verification checkout")?;
