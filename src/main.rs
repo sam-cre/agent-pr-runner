@@ -1589,7 +1589,8 @@ fn resolve_program(program: &str) -> Option<PathBuf> {
 
 /// `{cache}` in a check's argument or environment value becomes the runner's build cache folder.
 fn expand(text: &str, cache: &Path) -> String {
-    text.replace("{cache}", &cache.display().to_string())
+    // A plain path: the Windows extended-length prefix breaks cargo and other tools.
+    text.replace("{cache}", &setup::plain(cache))
 }
 
 /// Whether a step applies to this checkout (all of its `only_if_exists` paths are there).
