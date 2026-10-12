@@ -690,3 +690,21 @@ fn step_folders_must_stay_inside_the_checkout() {
     assert!(!safe_relative("app\\src"));
     assert!(!safe_relative(""));
 }
+
+#[test]
+fn deleted_files_pass_even_when_their_folder_is_gone() {
+    let dir = std::env::temp_dir().join(format!("agent-pr-runner-paths-{}", std::process::id()));
+    fs::create_dir_all(dir.join("docs/todo")).unwrap();
+    fs::write(dir.join("docs/todo/README.md"), "kept").unwrap();
+    // The whole C-01-core-types folder was moved away, so two components are missing.
+    assert!(validate_workspace_path(&dir, "docs/todo/C-01-core-types/README.md").is_ok());
+    assert!(validate_workspace_path(&dir, "docs/todo/gone.md").is_ok());
+    assert!(validate_workspace_path(&dir, "docs/todo/README.md").is_ok());
+    // Components that do exist are still checked, and missing ones must still be plain names.
+    assert!(validate_workspace_path(&dir, "docs/todo/README.md/child.md").is_err());
+    assert!(validate_workspace_path(&dir, "docs/gone/../../outside.md").is_err());
+    if cfg!(windows) {
+        assert!(validate_workspace_path(&dir, "Docs/todo/README.md").is_err());
+    }
+    let _ = fs::remove_dir_all(&dir);
+}

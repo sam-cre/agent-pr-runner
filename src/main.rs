@@ -569,10 +569,15 @@ fn validate_config(config: &Config) -> Result<()> {
 fn validate_workspace_path(repo: &Path, file: &str) -> Result<()> {
     let components: Vec<_> = Path::new(file).components().collect();
     let mut current = repo.to_path_buf();
+    let mut missing = false;
     for (index, component) in components.iter().enumerate() {
         let Component::Normal(name) = component else {
             bail!("unsafe requested path: {file}");
         };
+        if missing {
+            // Nothing below a missing component exists, so there is nothing left to inspect.
+            continue;
+        }
         let next = current.join(name);
         match fs::symlink_metadata(&next) {
             Ok(metadata) => {
@@ -589,11 +594,11 @@ fn validate_workspace_path(repo: &Path, file: &str) -> Result<()> {
                     bail!("requested path has a non-directory parent: {file}");
                 }
             }
-            Err(err)
-                if err.kind() == std::io::ErrorKind::NotFound && index + 1 == components.len() =>
-            {
-                // Deleted tracked files have no final directory entry. The staged-path check
-                // below still requires Git to report this exact spelling.
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                // Deleted tracked files have no directory entry, and neither do their parent
+                // folders when the whole folder was removed. The staged-path check below still
+                // requires Git to report this exact spelling.
+                missing = true;
             }
             Err(err) => return Err(err).with_context(|| format!("checking requested path {file}")),
         }
