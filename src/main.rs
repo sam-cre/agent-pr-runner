@@ -30,6 +30,9 @@ const COMMAND_TIMEOUT: Duration = Duration::from_secs(300);
 const MAX_CAPTURE: usize = 2 * 1024 * 1024;
 /// How long `submit` waits for a receipt before telling the agent to poll with `status`.
 const SUBMIT_WAIT: Duration = Duration::from_secs(4 * 3600);
+/// How often `serve`, `submit`, and `status` look at the queue. These are local file checks, not
+/// GitHub calls, so a short interval costs nothing against the API rate limit.
+const QUEUE_POLL: Duration = Duration::from_millis(250);
 
 // ---------------------------------------------------------------------------------------------
 // Configuration
@@ -233,6 +236,38 @@ struct Receipt {
     /// The exact command for that next step, when there is one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     next: Option<String>,
+    /// How far into the request each step finished, so a slow publish shows where the time went.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    phases: Vec<Phase>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+struct Phase {
+    phase: String,
+    /// Milliseconds since the runner took the request.
+    ms: u64,
+}
+
+/// Records the moment each step of one request finished.
+struct Timeline {
+    start: Instant,
+    phases: Vec<Phase>,
+}
+
+impl Timeline {
+    fn new() -> Self {
+        Self {
+            start: Instant::now(),
+            phases: Vec::new(),
+        }
+    }
+
+    fn mark(&mut self, phase: &str) {
+        self.phases.push(Phase {
+            phase: phase.into(),
+            ms: u64::try_from(self.start.elapsed().as_millis()).unwrap_or(u64::MAX),
+        });
+    }
 }
 
 struct Capture {
@@ -773,6 +808,13 @@ fn gh(config: &Config, args: &[&str]) -> Result<Capture> {
     run_command(gh_command(config, args)?, COMMAND_TIMEOUT)
 }
 
+/// The result of a read started on its own thread, with a panic reported as an error.
+fn joined<T>(handle: thread::ScopedJoinHandle<'_, Result<T>>) -> Result<T> {
+    handle
+        .join()
+        .unwrap_or_else(|_| Err(anyhow::anyhow!("a parallel GitHub read panicked")))
+}
+
 fn checked(output: Capture, label: &str) -> Result<String> {
     if !output.success {
         bail!("{label} failed: {}", failure_excerpt(&output));
@@ -979,9 +1021,30 @@ fn open_prs_synced(
     Ok(prs)
 }
 
-fn find_or_create_pr(config: &Config, request: &Request, head: &str) -> Result<ExistingPr> {
+/// Whether `git push --porcelain` output shows the push created `branch` on the remote.
+fn push_created_branch(porcelain: &str, branch: &str) -> bool {
+    let refs = format!("refs/heads/{branch}:refs/heads/{branch}");
+    porcelain.lines().any(|line| {
+        let mut fields = line.split('\t');
+        fields.next() == Some("*") && fields.next() == Some(refs.as_str())
+    })
+}
+
+fn find_or_create_pr(
+    config: &Config,
+    request: &Request,
+    head: &str,
+    new_branch: bool,
+) -> Result<ExistingPr> {
     let body = pr_body(request);
-    let existing = open_prs_synced(config, request, head, false)?;
+    // A branch the push just created had no remote ref a moment ago, and GitHub closes a PR when
+    // its head branch is deleted, so no open PR can exist for it yet. The head check after
+    // `gh pr create` still runs either way.
+    let existing = if new_branch {
+        Vec::new()
+    } else {
+        open_prs_synced(config, request, head, false)?
+    };
     if existing.len() > 1 {
         bail!("multiple open PRs match this branch");
     }
@@ -1177,19 +1240,48 @@ fn ci_run(
     if latest.status != "completed" {
         return Ok(None);
     }
-    let metadata = checked(
-        gh(
-            config,
-            &[
-                "api",
-                &format!(
-                    "repos/{}/actions/runs/{}",
-                    config.repository, latest.database_id
-                ),
-            ],
-        )?,
-        "reading CI run provenance",
-    )?;
+    let run_path = format!(
+        "repos/{}/actions/runs/{}",
+        config.repository, latest.database_id
+    );
+    let run_id = latest.database_id.to_string();
+    let pr = pr_number.to_string();
+    // The three reads only read and do not depend on each other, so they run at the same time.
+    // Their results are still judged in the order below, so a provenance mismatch is reported
+    // before anything the other two returned.
+    let (metadata, checks, view) = thread::scope(|scope| {
+        let checks = scope.spawn(|| {
+            gh(
+                config,
+                &[
+                    "pr",
+                    "checks",
+                    &pr,
+                    "-R",
+                    &config.repository,
+                    "--json",
+                    "name,link,workflow",
+                ],
+            )
+        });
+        let view = scope.spawn(|| {
+            gh(
+                config,
+                &[
+                    "run",
+                    "view",
+                    &run_id,
+                    "-R",
+                    &config.repository,
+                    "--json",
+                    "headSha,status,conclusion,event,workflowName,jobs",
+                ],
+            )
+        });
+        let metadata = gh(config, &["api", &run_path]);
+        (metadata, joined(checks), joined(view))
+    });
+    let metadata = checked(metadata?, "reading CI run provenance")?;
     let metadata: serde_json::Value = serde_json::from_str(&metadata)?;
     if !run_matches_pr(
         &metadata,
@@ -1200,40 +1292,14 @@ fn ci_run(
     ) {
         bail!("CI run is not from this PR, head/base commits, and pinned workflow file");
     }
-    let checks = gh(
-        config,
-        &[
-            "pr",
-            "checks",
-            &pr_number.to_string(),
-            "-R",
-            &config.repository,
-            "--json",
-            "name,link,workflow",
-        ],
-    )?;
-    let checks: Vec<PrCheckLink> = match serde_json::from_str(&checks.stdout) {
+    let checks: Vec<PrCheckLink> = match serde_json::from_str(&checks?.stdout) {
         Ok(checks) => checks,
         Err(_) => return Ok(None),
     };
     if !checks_link_to_run(&checks, &config.ci, &config.repository, latest.database_id) {
         return Ok(None);
     }
-    let view = checked(
-        gh(
-            config,
-            &[
-                "run",
-                "view",
-                &latest.database_id.to_string(),
-                "-R",
-                &config.repository,
-                "--json",
-                "headSha,status,conclusion,event,workflowName,jobs",
-            ],
-        )?,
-        "reading commit-bound CI jobs",
-    )?;
+    let view = checked(view?, "reading commit-bound CI jobs")?;
     let run: serde_json::Value = serde_json::from_str(&view)?;
     if run["headSha"] != expected
         || run["event"] != "pull_request"
@@ -1999,6 +2065,7 @@ fn needs_fix(
         failure_kind: kind,
         action: None,
         next: None,
+        phases: Vec::new(),
     }
 }
 
@@ -2023,7 +2090,7 @@ fn check_operator_setup(config: &Config) -> Result<()> {
 }
 
 /// Runs one request after `check_operator_setup` passed.
-fn execute(config: &Config, request: &Request) -> Result<Receipt> {
+fn execute(config: &Config, request: &Request, timeline: &mut Timeline) -> Result<Receipt> {
     validate_request(request, &config.policy())?;
     if targets_base(&request.branch, &config.base_branch) {
         bail!("request branch must not be the base branch");
@@ -2113,7 +2180,8 @@ fn execute(config: &Config, request: &Request) -> Result<Receipt> {
 
     // A failed attribution check above stops before any push. The runner never rewrites a commit
     // to hide provenance; the operator can inspect and repair a rejected local commit explicitly.
-    {
+    timeline.mark("committed");
+    let new_branch = {
         let _lock = repo_lock(config)?;
         let local = checked(
             git(config, &["rev-parse", "HEAD"], false)?,
@@ -2122,17 +2190,20 @@ fn execute(config: &Config, request: &Request) -> Result<Receipt> {
         if local != head {
             bail!("local HEAD changed before push");
         }
-        checked(
+        let pushed = checked(
             git(
                 config,
-                &["push", "-u", &config.remote, &request.branch],
+                &["push", "--porcelain", "-u", &config.remote, &request.branch],
                 false,
             )?,
             "pushing",
         )?;
-    }
-    let pr = find_or_create_pr(config, request, &head)?;
+        push_created_branch(&pushed, &request.branch)
+    };
+    timeline.mark("pushed");
+    let pr = find_or_create_pr(config, request, &head, new_branch)?;
     let expected_base = verify_pr_head(config, request, &pr, &head)?;
+    timeline.mark("pr_ready");
     // Wait for CI; an infrastructure-looking failure gets exactly one rerun of the failed jobs.
     // When GitHub refused to start the jobs at all for billing reasons, the runner runs the
     // configured checks itself on a clean checkout of this commit instead.
@@ -2181,6 +2252,7 @@ fn execute(config: &Config, request: &Request) -> Result<Receipt> {
             other => break Some(other),
         }
     };
+    timeline.mark("ci_done");
     if let Some(result) = failure {
         let (detail, path, kind) = match result {
             Ok(run) => {
@@ -2216,7 +2288,16 @@ fn execute(config: &Config, request: &Request) -> Result<Receipt> {
     if local != head || current_branch != request.branch {
         bail!("local branch changed while CI ran; refusing automatic merge");
     }
-    if verify_pr_head(config, request, &pr, &head)? != expected_base {
+    // The CI recheck only reads, so it runs at the same time as the PR head check. The head check
+    // is still judged first, so a moved base is reported before anything the recheck found.
+    let (base, ci_recheck) = thread::scope(|scope| {
+        let recheck = local_ran
+            .is_none()
+            .then(|| scope.spawn(|| ci_run(config, &head, &expected_base, pr.number)));
+        let base = verify_pr_head(config, request, &pr, &head);
+        (base, recheck.map(joined))
+    });
+    if base? != expected_base {
         bail!("base branch moved after CI; refusing automatic merge");
     }
     // Recheck immediately before the write. --match-head-commit closes the race with a later push,
@@ -2241,7 +2322,7 @@ fn execute(config: &Config, request: &Request) -> Result<Receipt> {
             "noting the local checks on the PR",
         )?;
     } else {
-        let run = ci_run(config, &head, &expected_base, pr.number)?;
+        let run = ci_recheck.context("CI recheck did not run")??;
         if run
             .as_ref()
             .map(|run| ci_state(run, &config.ci.required_jobs))
@@ -2250,6 +2331,7 @@ fn execute(config: &Config, request: &Request) -> Result<Receipt> {
             bail!("CI changed before merge; refusing to merge");
         }
     }
+    timeline.mark("merge_checked");
     let number = pr.number.to_string();
     let mut merge_args = vec![
         "pr",
@@ -2289,6 +2371,7 @@ fn execute(config: &Config, request: &Request) -> Result<Receipt> {
             return Err(err);
         }
     }
+    timeline.mark("merged");
     let refresh = (|| -> Result<()> {
         checked(
             git(config, &["switch", &config.base_branch], false)?,
@@ -2318,6 +2401,9 @@ fn execute(config: &Config, request: &Request) -> Result<Receipt> {
         }
         Ok(())
     })();
+    if refresh.is_ok() {
+        timeline.mark("refreshed");
+    }
     if let Err(err) = refresh {
         return Ok(Receipt {
             id: request.id.clone(),
@@ -2328,6 +2414,7 @@ fn execute(config: &Config, request: &Request) -> Result<Receipt> {
             failure_kind: None,
             action: None,
             next: None,
+            phases: Vec::new(),
         });
     }
     Ok(Receipt {
@@ -2347,6 +2434,7 @@ fn execute(config: &Config, request: &Request) -> Result<Receipt> {
         failure_kind: None,
         action: None,
         next: None,
+        phases: Vec::new(),
     })
 }
 
@@ -2409,7 +2497,7 @@ fn submit(queue: &Path, request_path: &Path) -> Result<()> {
                 request.id
             );
         }
-        thread::sleep(Duration::from_secs(2));
+        thread::sleep(QUEUE_POLL);
     }
 }
 
@@ -2433,7 +2521,7 @@ fn status(queue: &Path, id: &str, wait: Duration) -> Result<()> {
         if start.elapsed() >= wait {
             break;
         }
-        thread::sleep(Duration::from_secs(2));
+        thread::sleep(QUEUE_POLL);
     }
     let state = if queue_path(&queue, id, "processing").exists() {
         "processing"
@@ -2612,6 +2700,7 @@ fn error_receipt(id: &str, err: &anyhow::Error) -> Receipt {
         failure_kind: None,
         action: None,
         next: None,
+        phases: Vec::new(),
     }
 }
 
@@ -2634,7 +2723,10 @@ fn run_request(config: &Config, processing: &Path, id: &str) -> (Option<Request>
         receipt.action = Some(agent::REPORT.into());
         return (Some(request), receipt);
     }
-    let receipt = execute(config, &request).unwrap_or_else(|err| error_receipt(id, &err));
+    let mut timeline = Timeline::new();
+    let mut receipt =
+        execute(config, &request, &mut timeline).unwrap_or_else(|err| error_receipt(id, &err));
+    receipt.phases = timeline.phases;
     (Some(request), receipt)
 }
 
@@ -2678,6 +2770,7 @@ fn serve(config_path: &Path) -> Result<()> {
                     failure_kind: None,
                     action: Some(agent::REPORT.into()),
                     next: None,
+                    phases: Vec::new(),
                 },
             )?;
         }
@@ -2721,7 +2814,7 @@ fn serve(config_path: &Path) -> Result<()> {
             archive_request(&config.queue_dir, &processing, id)?;
             tidy_build_cache(&config);
         }
-        thread::sleep(Duration::from_secs(2));
+        thread::sleep(QUEUE_POLL);
     }
 }
 

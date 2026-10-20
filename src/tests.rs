@@ -150,6 +150,47 @@ fn pr_heads_must_all_match_the_pushed_commit() {
 }
 
 #[test]
+fn only_a_push_that_created_the_branch_skips_the_pr_lookup() {
+    // Captured from `git push --porcelain -u origin feat/x`.
+    let created = "To ../remote.git\n*\trefs/heads/feat/x:refs/heads/feat/x\t[new branch]\nDone";
+    let updated =
+        "To ../remote.git\n \trefs/heads/feat/x:refs/heads/feat/x\t68846cf..31a3f20\nDone";
+    let same = "To ../remote.git\n=\trefs/heads/feat/x:refs/heads/feat/x\t[up to date]\nDone";
+    assert!(push_created_branch(created, "feat/x"));
+    assert!(push_created_branch(
+        &created.replace('\n', "\r\n"),
+        "feat/x"
+    ));
+    assert!(!push_created_branch(updated, "feat/x"));
+    assert!(!push_created_branch(same, "feat/x"));
+    assert!(
+        !push_created_branch(created, "feat"),
+        "another branch's ref"
+    );
+    assert!(!push_created_branch("", "feat/x"));
+}
+
+#[test]
+fn receipt_phases_are_in_order_and_left_out_when_empty() {
+    let mut timeline = Timeline::new();
+    timeline.mark("pushed");
+    timeline.mark("merged");
+    let names: Vec<&str> = timeline.phases.iter().map(|p| p.phase.as_str()).collect();
+    assert_eq!(names, ["pushed", "merged"]);
+    assert!(timeline.phases[0].ms <= timeline.phases[1].ms);
+    let mut receipt = error_receipt("r", &anyhow::anyhow!("x"));
+    assert!(!serde_json::to_string(&receipt).unwrap().contains("phases"));
+    receipt.phases = timeline.phases;
+    let line = serde_json::to_string(&receipt).unwrap();
+    assert!(
+        line.contains(r#""phases":[{"phase":"pushed","ms":"#),
+        "{line}"
+    );
+    let back: Receipt = serde_json::from_str(&line).unwrap();
+    assert_eq!(back.phases.len(), 2);
+}
+
+#[test]
 fn any_safe_branch_name_is_accepted() {
     let mut value = request();
     for branch in ["docs/example", "fix/parser-1", "feature/x", "plain-name"] {
@@ -281,6 +322,7 @@ fn failure_description_names_the_kind_and_keeps_the_excerpt() {
         failure_kind: None,
         action: None,
         next: None,
+        phases: Vec::new(),
     };
     assert!(!serde_json::to_string(&receipt)
         .unwrap()
