@@ -77,5 +77,10 @@ with spaces is quoted for PowerShell with `&`.
 
 `failure_kind` on `needs_fix` is `test_failure`, `lint`, `build`, `infra_transient`, or `unknown`.
 
+`phases` lists each step the request finished, in order, with `ms` since the runner took it:
+`committed`, `pushed`, `pr_ready`, `ci_done`, `merge_checked`, `merged`, `refreshed`. A receipt
+that stopped early lists only the steps it reached, and one that never started has none.
+It is for measuring where a publish spends its time; agents do not need to read it.
+
 `submit` exits with 0 only for `merged`. `status <queue> <id> --wait SECONDS` (at most 900)
 checks until the receipt exists or the time is up, so an agent never holds one long call.
