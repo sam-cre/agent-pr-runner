@@ -3,6 +3,7 @@
 //! carries a stable action code and the exact next command.
 
 use super::*;
+use std::sync::{Arc, Mutex};
 
 /// Receipt action codes. They are part of the agent-facing contract: never rename one.
 pub(crate) const DONE: &str = "done";
@@ -21,6 +22,10 @@ const HEARTBEAT_FILE: &str = "serve.json";
 const HEARTBEAT_EVERY: Duration = Duration::from_secs(30);
 /// Seconds after which a heartbeat means the runner has stopped.
 const HEARTBEAT_STALE: u64 = 120;
+/// Minutes a `serve` that `publish` started waits with an empty queue before it exits.
+pub(crate) const AUTO_IDLE_MINUTES: u64 = 15;
+/// Where a `serve` that `publish` started writes its output, inside the queue.
+const SERVE_LOG: &str = "serve.log";
 /// The longest `status --wait` holds an agent's shell.
 pub(crate) const MAX_STATUS_WAIT: u64 = 900;
 const MAX_REQUEST: usize = 64 * 1024;
@@ -231,7 +236,11 @@ fn unix_now() -> u64 {
 
 /// Records, now and every 30 seconds while `serve` lives, which config it runs on. A thread does
 /// it, so a 30-minute CI wait does not look like a stopped runner.
-pub(crate) fn start_heartbeat(config_path: &Path, config_bytes: &[u8], queue: &Path) -> Result<()> {
+pub(crate) fn start_heartbeat(
+    config_path: &Path,
+    config_bytes: &[u8],
+    queue: &Path,
+) -> Result<HeartbeatGuard> {
     let mut beat = Heartbeat {
         pid: std::process::id(),
         config: plain_path(config_path)?,
@@ -240,11 +249,98 @@ pub(crate) fn start_heartbeat(config_path: &Path, config_bytes: &[u8], queue: &P
     };
     let path = queue.join(HEARTBEAT_FILE);
     write_json(&path, &beat)?;
+    let alive = Arc::new(Mutex::new(true));
+    let guard = HeartbeatGuard {
+        alive: Arc::clone(&alive),
+        path: path.clone(),
+    };
     thread::spawn(move || loop {
         thread::sleep(HEARTBEAT_EVERY);
+        // The beat is written under the lock, so a stopped heartbeat never writes again.
+        let alive = alive.lock().unwrap_or_else(|e| e.into_inner());
+        if !*alive {
+            return;
+        }
         beat.beat = unix_now();
         let _ = write_json(&path, &beat);
     });
+    Ok(guard)
+}
+
+/// Stops one heartbeat, so `publish` can tell the runner is gone the moment it exits.
+pub(crate) struct HeartbeatGuard {
+    alive: Arc<Mutex<bool>>,
+    path: PathBuf,
+}
+
+impl HeartbeatGuard {
+    pub(crate) fn stop(&self) {
+        let mut alive = self.alive.lock().unwrap_or_else(|e| e.into_inner());
+        *alive = false;
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
+/// Whether a `serve` reported on this queue recently enough to count as running.
+fn runner_alive(queue: &Path) -> bool {
+    fs::read(queue.join(HEARTBEAT_FILE))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Heartbeat>(&bytes).ok())
+        .is_some_and(|beat| unix_now().saturating_sub(beat.beat) <= HEARTBEAT_STALE)
+}
+
+/// Starts `serve` hidden and detached when nothing is serving the queue. It stops by itself after
+/// `AUTO_IDLE_MINUTES` with an empty queue, so nothing has to run at logon. Its output goes to
+/// `serve.log` in the queue.
+fn ensure_serving(config_path: &Path, queue: &Path) -> Result<bool> {
+    if runner_alive(queue) {
+        return Ok(false);
+    }
+    let log = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(queue.join(SERVE_LOG))?;
+    let minutes = AUTO_IDLE_MINUTES.to_string();
+    let mut command = Command::new(std::env::current_exe()?);
+    command
+        .args([
+            "serve".as_ref(),
+            config_path.as_os_str(),
+            "--idle-exit".as_ref(),
+            minutes.as_ref(),
+        ])
+        .stdin(Stdio::null())
+        .stdout(log.try_clone()?)
+        .stderr(log);
+    spawn_detached(command).context("starting the runner")?;
+    Ok(true)
+}
+
+/// Spawns a process that outlives this one and opens no window. On Windows it also leaves the
+/// caller's job object when the job allows that, so closing the agent's shell does not end it.
+#[cfg(windows)]
+fn spawn_detached(mut command: Command) -> Result<()> {
+    use std::os::windows::process::CommandExt;
+    const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+    const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
+    let flags = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
+    command.creation_flags(flags | CREATE_BREAKAWAY_FROM_JOB);
+    if command.spawn().is_ok() {
+        return Ok(());
+    }
+    // A job that forbids breakaway refuses the flag; start inside it instead.
+    command.creation_flags(flags);
+    command.spawn()?;
+    Ok(())
+}
+
+#[cfg(not(windows))]
+fn spawn_detached(mut command: Command) -> Result<()> {
+    use std::os::unix::process::CommandExt;
+    // Its own process group, so a terminal closing or Ctrl+C in the agent's shell does not reach it.
+    command.process_group(0);
+    command.spawn()?;
     Ok(())
 }
 
@@ -256,19 +352,18 @@ fn heartbeat_problems(config_path: &Path, queue: &Path) -> Vec<Problem> {
     let Some(beat) = beat else {
         return vec![Problem::warning(
             "runner_not_seen",
-            "no heartbeat from serve (it is stopped, or older than this version); the request \
-             will wait in the queue until it runs",
-            format!("ask the operator to start it: {start}"),
+            "no heartbeat from serve (it is stopped, or older than this version)",
+            format!("publish starts it when it queues the request; otherwise run: {start}"),
         )];
     };
     if unix_now().saturating_sub(beat.beat) > HEARTBEAT_STALE {
         return vec![Problem::warning(
             "runner_stopped",
             format!(
-                "serve last reported {} seconds ago; the request will wait until it runs again",
+                "serve last reported {} seconds ago",
                 unix_now().saturating_sub(beat.beat)
             ),
-            format!("ask the operator to start it: {start}"),
+            format!("publish starts it when it queues the request; otherwise run: {start}"),
         )];
     }
     let here = plain_path(config_path).unwrap_or_default();
@@ -886,6 +981,11 @@ pub(crate) fn publish(config_path: &Path, args: &[String]) -> Result<()> {
         "queued {} on {start} {}: {what}",
         request.id, request.branch
     );
+    // Checked after queueing: a runner that is just stopping rescans the queue after it removes
+    // its heartbeat, so either it sees this request or this check sees it gone.
+    if ensure_serving(config_path, &queue)? {
+        println!("started the runner; it stops by itself after {AUTO_IDLE_MINUTES} idle minutes");
+    }
     println!("next: {}", status_command(&queue, &request.id)?);
     Ok(())
 }

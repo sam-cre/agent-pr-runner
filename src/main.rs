@@ -2738,10 +2738,44 @@ fn archive_request(queue: &Path, processing: &Path, id: &str) -> Result<()> {
     Ok(())
 }
 
-fn serve(config_path: &Path) -> Result<()> {
+/// The request files waiting in the queue, oldest name first.
+fn pending_requests(queue: &Path) -> Result<Vec<PathBuf>> {
+    let mut pending = Vec::new();
+    for entry in fs::read_dir(queue)? {
+        let path = entry?.path();
+        if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .is_some_and(|n| n.ends_with(".request.json"))
+        {
+            pending.push(path);
+        }
+    }
+    pending.sort();
+    Ok(pending)
+}
+
+/// How long a `serve` started with `--idle-exit` waits for an earlier one that is just exiting.
+const SERVE_LOCK_WAIT: Duration = Duration::from_secs(15);
+
+/// Processes queued requests. With `idle_exit`, it stops after that long with an empty queue;
+/// without it, it runs until stopped.
+fn serve(config_path: &Path, idle_exit: Option<Duration>) -> Result<()> {
     let config = load_installed_config(config_path)?;
-    let _serve_lock = serve_lock(&config.queue_dir)?;
-    agent::start_heartbeat(config_path, &fs::read(config_path)?, &config.queue_dir)?;
+    let _serve_lock = {
+        let start = Instant::now();
+        loop {
+            match serve_lock(&config.queue_dir) {
+                Ok(lock) => break lock,
+                Err(err) if idle_exit.is_none() || start.elapsed() >= SERVE_LOCK_WAIT => {
+                    return Err(err)
+                }
+                Err(_) => thread::sleep(QUEUE_POLL),
+            }
+        }
+    };
+    let config_bytes = fs::read(config_path)?;
+    let mut heartbeat = agent::start_heartbeat(config_path, &config_bytes, &config.queue_dir)?;
     // A crash after taking a request might already have committed or pushed it. Never replay that
     // request automatically. Return an inspection-required receipt instead.
     for entry in fs::read_dir(&config.queue_dir)? {
@@ -2781,19 +2815,21 @@ fn serve(config_path: &Path) -> Result<()> {
         config.repository,
         config.queue_dir.display()
     );
+    let mut idle_since = Instant::now();
     loop {
-        let mut pending = Vec::new();
-        for entry in fs::read_dir(&config.queue_dir)? {
-            let path = entry?.path();
-            if path
-                .file_name()
-                .and_then(|n| n.to_str())
-                .is_some_and(|n| n.ends_with(".request.json"))
-            {
-                pending.push(path);
+        let pending = pending_requests(&config.queue_dir)?;
+        if pending.is_empty() && idle_exit.is_some_and(|limit| idle_since.elapsed() >= limit) {
+            // Remove the heartbeat first, then look once more: a publish that queued before this
+            // point is seen here, and one after it sees no runner and starts a new one.
+            heartbeat.stop();
+            if pending_requests(&config.queue_dir)?.is_empty() {
+                eprintln!("agent-pr-runner: queue idle, stopping");
+                return Ok(());
             }
+            heartbeat = agent::start_heartbeat(config_path, &config_bytes, &config.queue_dir)?;
+            continue;
         }
-        pending.sort();
+        let worked = !pending.is_empty();
         for path in pending {
             let name = path
                 .file_name()
@@ -2814,6 +2850,9 @@ fn serve(config_path: &Path) -> Result<()> {
             archive_request(&config.queue_dir, &processing, id)?;
             tidy_build_cache(&config);
         }
+        if worked {
+            idle_since = Instant::now();
+        }
         thread::sleep(QUEUE_POLL);
     }
 }
@@ -2822,7 +2861,9 @@ const USAGE: &str = "usage:
   agent-pr-runner init --repo PATH [OPTIONS]    write a config for a repository (see below)
   agent-pr-runner snippet CONFIG.json           print the agent instructions with real paths
   agent-pr-runner doctor CONFIG.json            check the install, login, remote, and check programs
-  agent-pr-runner serve CONFIG.json             process queued requests until stopped
+  agent-pr-runner serve CONFIG.json [--idle-exit MINUTES]
+                                                process queued requests until stopped, or until
+                                                the queue has been empty that long
   agent-pr-runner publish CONFIG.json OPTIONS   build a request from git status, check it, queue it
   agent-pr-runner preflight CONFIG.json REQUEST.json
                                                 list every problem with a request; queues nothing
@@ -2867,7 +2908,15 @@ fn utf8_args(args: &[std::ffi::OsString]) -> Result<Vec<String>> {
 fn main() -> Result<()> {
     let args: Vec<_> = std::env::args_os().collect();
     match args.as_slice() {
-        [_, mode, config] if mode == "serve" => serve(Path::new(config)),
+        [_, mode, config] if mode == "serve" => serve(Path::new(config), None),
+        [_, mode, config, flag, minutes] if mode == "serve" && flag == "--idle-exit" => {
+            let minutes: u64 = minutes
+                .to_str()
+                .and_then(|m| m.parse().ok())
+                .filter(|m| *m > 0)
+                .context("--idle-exit needs a whole number of minutes above 0")?;
+            serve(Path::new(config), Some(Duration::from_secs(minutes * 60)))
+        }
         [_, mode, config] if mode == "doctor" => doctor(Path::new(config)),
         [_, mode, config] if mode == "snippet" => setup::snippet(Path::new(config)),
         [_, mode, rest @ ..] if mode == "init" => setup::init(&utf8_args(rest)?),

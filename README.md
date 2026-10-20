@@ -49,13 +49,14 @@ You need Rust, Git, the GitHub CLI (`gh`), and a GitHub repository with a CI wor
 
    Options (billing fallback checks, protected manifest files, and more) are in [docs/configuration.md](docs/configuration.md#init-options).
 
-4. Start the runner and leave it running (one per repository):
+4. Nothing to start. `publish` starts the runner hidden when it queues a request, and the runner
+   stops by itself after 15 idle minutes. To run it by hand instead (one per repository):
 
    ```sh
    ~/agent-pr-runner/agent-pr-runner serve ~/agent-pr-runner/configs/<project>.json
    ```
 
-   To start it at login, see step 9 of [SETUP-FOR-AGENTS.md](SETUP-FOR-AGENTS.md#9-start-the-runner).
+   See step 9 of [SETUP-FOR-AGENTS.md](SETUP-FOR-AGENTS.md#9-start-the-runner).
 
 5. Print the publishing rules with your paths filled in, and paste them into your agent instructions file (`AGENTS.md`, `CLAUDE.md`, or similar):
 
@@ -71,11 +72,11 @@ On Windows, the binary is `agent-pr-runner.exe` in `%USERPROFILE%\agent-pr-runne
 
 ## Day to day
 
-The agent makes a change, runs your checks, and runs `agent-pr-runner publish <config> --message "fix: ..." --verify "check=result" ...`. Publish builds the request from `git status`, checks it (`preflight`), queues it, and returns at once. Each receipt names an `action` and the exact `next` command, so the agent reports the PR link or fixes and retries without guessing. You keep `serve` running, review merged PRs, and apply changes to protected files when the agent asks.
+The agent makes a change, runs your checks, and runs `agent-pr-runner publish <config> --message "fix: ..." --verify "check=result" ...`. Publish builds the request from `git status`, checks it (`preflight`), queues it, and returns at once. Each receipt names an `action` and the exact `next` command, so the agent reports the PR link or fixes and retries without guessing. You review merged PRs, and apply changes to protected files when the agent asks.
 
 Request and receipt fields: [docs/requests.md](docs/requests.md).
 
-**Update:** pull this repository, run the install script again, and restart `serve`. Configs and queues are kept.
+**Update:** pull this repository and run the install script again. A runner `publish` started picks up the new binary the next time it starts; restart any `serve` you started by hand. Configs and queues are kept.
 **Remove:** stop `serve` (and any scheduled task or service), then delete the install folder.
 
 ## Limits
