@@ -62,6 +62,8 @@ Receipts carry a `detail` line. Find its wording below.
 
 ## Keeping `serve` running
 
-`serve` runs until it is stopped. It processes one request at a time and polls the queue every two
-seconds. If it stops mid-request, the next start writes `needs_inspection` for that request.
+`publish` starts `serve` when none is running, and that `serve` stops after 15 minutes with an
+empty queue (`--idle-exit 15`); its output is in `serve.log` in the queue. A `serve` started by
+hand without `--idle-exit` runs until it is stopped. It processes one request at a time and checks
+the queue every 250 ms. If it stops mid-request, the next start writes `needs_inspection` for that request.
 Check the branch, the commit, and the PR on GitHub before resubmitting with a new id.

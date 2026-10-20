@@ -143,35 +143,14 @@ it off. The runner refuses attribution either way; turning it off avoids refused
 
 ## 9. Start the runner
 
-**Ask** the user how they want `serve` to run. Use the `serve` command `init` printed.
+Nothing to do. `publish` checks for a running `serve` each time it queues a request and starts one
+hidden when there is none. That runner stops by itself after 15 minutes with an empty queue, so it
+does not run at login and leaves no window open. Its output goes to `serve.log` in the queue.
 
-- **In a terminal for now:** the user opens a terminal, runs the `serve` command, and leaves it
-  open. Do not start it as a background process of your own session; it would stop when your
-  session ends.
-- **Automatically at login, Windows** (you may run this after a yes):
-
-  ```powershell
-  schtasks /Create /TN "agent-pr-runner <name>" /SC ONLOGON /RL LIMITED /TR "`"<runner>`" serve `"<config>`""
-  schtasks /Run /TN "agent-pr-runner <name>"
-  ```
-
-- **Automatically at login, Linux with systemd:** write
-  `~/.config/systemd/user/agent-pr-runner-<name>.service`:
-
-  ```ini
-  [Unit]
-  Description=agent-pr-runner for <name>
-
-  [Service]
-  ExecStart=<runner> serve <config>
-  Restart=on-failure
-
-  [Install]
-  WantedBy=default.target
-  ```
-
-  then run `systemctl --user enable --now agent-pr-runner-<name>`.
-- **macOS:** use the terminal option.
+Requests queued with `submit` instead of `publish` do not start it. For those, or to watch it
+work, the user runs the `serve` command `init` printed in a terminal (add `--idle-exit MINUTES`
+to have it stop when idle). Do not start a plain `serve` as a background process of your own
+session; it would stop when your session ends.
 
 Only one `serve` may run per config.
 
