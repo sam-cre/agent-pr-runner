@@ -325,6 +325,7 @@ fn spawn_detached(mut command: Command) -> Result<()> {
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     const CREATE_BREAKAWAY_FROM_JOB: u32 = 0x0100_0000;
     let flags = CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW;
+    let _private = PrivateStdHandles::new();
     command.creation_flags(flags | CREATE_BREAKAWAY_FROM_JOB);
     if command.spawn().is_ok() {
         return Ok(());
@@ -333,6 +334,57 @@ fn spawn_detached(mut command: Command) -> Result<()> {
     command.creation_flags(flags);
     command.spawn()?;
     Ok(())
+}
+
+/// Windows starts a child with every inheritable handle of its parent, not only the three it is
+/// given. A shell hands `publish` inheritable stdio, so without this a `publish ... | cat` would
+/// not end until `serve` stops, because `serve` would hold the pipe. While it lives, this
+/// process's own stdio handles are not inheritable; children still get the stdio they are given.
+#[cfg(windows)]
+struct PrivateStdHandles(Vec<windows::Win32::Foundation::HANDLE>);
+
+#[cfg(windows)]
+impl PrivateStdHandles {
+    fn new() -> Self {
+        use std::os::windows::io::AsRawHandle;
+        use windows::Win32::Foundation::{
+            GetHandleInformation, SetHandleInformation, HANDLE, HANDLE_FLAGS, HANDLE_FLAG_INHERIT,
+        };
+        let handles = [
+            std::io::stdin().as_raw_handle(),
+            std::io::stdout().as_raw_handle(),
+            std::io::stderr().as_raw_handle(),
+        ];
+        let mut cleared = Vec::new();
+        for raw in handles {
+            let handle = HANDLE(raw);
+            let mut flags = 0u32;
+            // Null, console, or already private handles are left alone.
+            unsafe {
+                if handle.is_invalid()
+                    || GetHandleInformation(handle, &mut flags).is_err()
+                    || flags & HANDLE_FLAG_INHERIT.0 == 0
+                    || SetHandleInformation(handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAGS(0)).is_err()
+                {
+                    continue;
+                }
+            }
+            cleared.push(handle);
+        }
+        Self(cleared)
+    }
+}
+
+#[cfg(windows)]
+impl Drop for PrivateStdHandles {
+    fn drop(&mut self) {
+        use windows::Win32::Foundation::{SetHandleInformation, HANDLE_FLAG_INHERIT};
+        for handle in &self.0 {
+            unsafe {
+                let _ = SetHandleInformation(*handle, HANDLE_FLAG_INHERIT.0, HANDLE_FLAG_INHERIT);
+            }
+        }
+    }
 }
 
 #[cfg(not(windows))]
@@ -993,6 +1045,60 @@ pub(crate) fn publish(config_path: &Path, args: &[String]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    const DETACH_HELPER_ENV: &str = "AGENT_PR_RUNNER_DETACH_HELPER";
+
+    /// Stands in for `publish`: run alone with the env var set, it starts a long-lived detached
+    /// child the way `ensure_serving` does and returns. Without the env var it does nothing.
+    #[test]
+    fn detached_child_helper() {
+        if std::env::var_os(DETACH_HELPER_ENV).is_none() {
+            return;
+        }
+        let mut command = if cfg!(windows) {
+            let mut c = Command::new("ping");
+            c.args(["-n", "20", "127.0.0.1"]);
+            c
+        } else {
+            let mut c = Command::new("sleep");
+            c.arg("20");
+            c
+        };
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        spawn_detached(command).expect("spawn detached");
+    }
+
+    /// `publish ... | cat` must end when publish does, not when the `serve` it started stops. The
+    /// detached child must not keep the caller's stdout pipe open.
+    #[test]
+    fn a_detached_child_does_not_hold_the_callers_pipe() {
+        let mut caller = Command::new(std::env::current_exe().unwrap());
+        caller
+            .args([
+                "--exact",
+                "agent::tests::detached_child_helper",
+                "--test-threads=1",
+            ])
+            .env(DETACH_HELPER_ENV, "1")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let started = Instant::now();
+        let output = caller.output().expect("run the helper");
+        let took = started.elapsed();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            took < Duration::from_secs(10),
+            "the caller's pipe stayed open for {took:?}"
+        );
+    }
 
     #[test]
     fn branch_names_come_from_the_message() {
